@@ -1,4 +1,6 @@
 import array
+import copy
+import io
 import json
 import math
 import shutil
@@ -49,6 +51,11 @@ def test_translations_preserve_ids_and_release_ollama(monkeypatch, job):
     payload = request.call_args.args[2]
     assert payload["keep_alive"] == 0
     assert payload["stream"] is False
+    assert payload["think"] is False
+    assert payload["options"]["temperature"] == 0
+    shape = payload["format"]["properties"]["segments"]
+    assert shape["minItems"] == shape["maxItems"] == 2
+    assert shape["items"]["properties"]["id"]["enum"] == [1, 2]
     assert "numbers" in payload["messages"][0]["content"]
     assert [r["id"] for r in json.loads(payload["messages"][1]["content"])] == [1, 2]
 
@@ -75,6 +82,49 @@ def test_reverse_translation_uses_taiwan_traditional_chinese(monkeypatch, job):
     monkeypatch.setattr(d, "ollama_request", request)
     d.translate_segments(job.segments, "zh", d.Settings())
     assert "繁體中文（臺灣用語）" in request.call_args.args[2]["messages"][0]["content"]
+
+
+def test_invalid_translation_retries_once_then_applies_complete_batch(monkeypatch, job):
+    requests = []
+
+    def request(settings, endpoint, payload):
+        requests.append(copy.deepcopy(payload))
+        if len(requests) == 1:
+            return translation_response([{"id": 1, "text": "partial"}])
+        assert [s.target for s in job.segments] == ["The product costs 100 dollars.", "Press Start."]
+        return translation_response([{"id": 1, "text": "Complete first"}, {"id": 2, "text": "Complete second"}])
+
+    monkeypatch.setattr(d, "ollama_request", request)
+    d.translate_segments(job.segments, "en", d.Settings())
+    assert len(requests) == 2
+    assert "segment count" in requests[1]["messages"][0]["content"]
+    assert [s.target for s in job.segments] == ["Complete first", "Complete second"]
+
+
+def test_invalid_translation_stops_after_two_calls(monkeypatch, job):
+    request = Mock(return_value=translation_response([]))
+    monkeypatch.setattr(d, "ollama_request", request)
+    with pytest.raises(d.DubbingError, match="已重試一次"):
+        d.translate_segments(job.segments, "en", d.Settings())
+    assert request.call_count == 2
+
+
+def test_unsupported_thinking_falls_back_without_disabling_validation(monkeypatch, job):
+    calls = []
+    error = d.DubbingError("HTTP 400: model does not support thinking")
+    error.__cause__ = d.urllib.error.HTTPError("http://localhost:11434/api/chat", 400, "Bad Request", None, None)
+
+    def request(settings, endpoint, payload):
+        calls.append(copy.deepcopy(payload))
+        if len(calls) == 1:
+            raise error
+        return translation_response([{"id": 1, "text": "First"}, {"id": 2, "text": "Second"}])
+
+    monkeypatch.setattr(d, "ollama_request", request)
+    d.translate_segments(job.segments, "en", d.Settings())
+    assert calls[0]["think"] is False and "think" not in calls[1]
+    assert calls[0]["format"] == calls[1]["format"]
+    assert [s.target for s in job.segments] == ["First", "Second"]
 
 
 def test_translation_batches_keep_global_ids(monkeypatch):
@@ -200,6 +250,14 @@ def test_ollama_connection_failure_is_not_silently_ignored(monkeypatch):
     monkeypatch.setattr(d.urllib.request, "urlopen", Mock(side_effect=OSError("connection refused")))
     with pytest.raises(d.DubbingError, match="connection refused"):
         d.ollama_request(d.Settings(), "/api/tags")
+
+
+def test_ollama_http_error_preserves_server_detail(monkeypatch):
+    error = d.urllib.error.HTTPError("http://localhost:11434/api/chat", 404, "Not Found", None,
+                                   io.BytesIO(b'{"error":"model gemma4:latest not found"}'))
+    monkeypatch.setattr(d.urllib.request, "urlopen", Mock(side_effect=error))
+    with pytest.raises(d.DubbingError, match="HTTP 404.*gemma4:latest not found"):
+        d.ollama_request(d.Settings(), "/api/chat", {"model": "gemma4:latest"})
 
 
 def test_prepare_stages_original_and_saves_both_languages(monkeypatch, tmp_path):
