@@ -50,6 +50,7 @@ class LiveEngine:
         self.settings, self.source, self.target = settings, source, target
         self.whisper = None
         self.ollama_loaded = False
+        self.ollama_context = 2048
         self.no_thinking = True
 
     def open(self):
@@ -65,32 +66,48 @@ class LiveEngine:
             download_root=str(ROOT / "models/whisper"), local_files_only=True,
         )
         if self.source != self.target or self.target == "zh":
+            self._sync_ollama_context()
             self.ollama_loaded = True
             ollama_request(self.settings, "/api/generate", {
                 "model": self.settings.ollama_model, "stream": False, "keep_alive": "3m",
-                "options": {"num_ctx": 2048},
+                "options": {"num_ctx": self.ollama_context},
             }, timeout=60)
+            self._sync_ollama_context()
+
+    def _sync_ollama_context(self):
+        # Other clients may use this model too; match its allocation before requesting work.
+        for model in ollama_request(self.settings, "/api/ps", timeout=10).get("models", []):
+            context = model.get("context_length")
+            if model.get("name") == self.settings.ollama_model and type(context) is int and context > 0:
+                self.ollama_context = context
+                break
 
     def process(self, audio):
         started = time.perf_counter()
         segments, _ = self.whisper.transcribe(
             audio, language=self.source, task="transcribe", beam_size=1,
+            best_of=1, temperature=0, without_timestamps=True,
             vad_filter=True, word_timestamps=False, condition_on_previous_text=False,
             initial_prompt="請使用繁體中文轉錄。" if self.source == "zh" else None,
         )
         source = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+        asr_done = time.perf_counter()
         text = self.translate(source) if source else ""
+        finished = time.perf_counter()
         return {"type": "result", "source": source, "text": text,
-                "seconds": round(time.perf_counter() - started, 2), "audio_seconds": round(len(audio) / RATE, 2)}
+                "asr_seconds": round(asr_done - started, 2),
+                "translation_seconds": round(finished - asr_done, 2) if source else 0,
+                "seconds": round(finished - started, 2), "audio_seconds": round(len(audio) / RATE, 2)}
 
     def translate(self, source):
         if self.source == self.target and self.target != "zh":
             return source
+        self._sync_ollama_context()
         payload = {
             "model": self.settings.ollama_model, "stream": False, "keep_alive": "3m",
             "format": {"type": "object", "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 4000}},
                        "required": ["text"], "additionalProperties": False},
-            "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 256},
+            "options": {"temperature": 0, "num_ctx": self.ollama_context, "num_predict": 256},
             "messages": [{"role": "system", "content": (
                 f"Translate the speech from {LANGUAGES[self.source]} into {LANGUAGES[self.target]}. "
                 "Return only JSON with a text field. Preserve meaning, names, numbers and units. "

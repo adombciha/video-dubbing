@@ -1,5 +1,6 @@
 export const RATE = 16000;
 export const MAX_SEGMENT_SAMPLES = RATE * 5;
+const MIN_SEGMENT_SAMPLES = RATE * 3;
 
 export function captureOptions(source, mute) {
   if (!['tab', 'system'].includes(source)) throw new Error('不支援的音訊來源');
@@ -37,7 +38,9 @@ export class AudioSegments {
     this.frames.push(samples);
     this.size += samples.length;
     this.silence = rms < 0.003 ? this.silence + samples.length : 0;
-    if (this.size >= MAX_SEGMENT_SAMPLES || this.silence >= RATE * 0.6) this.flush();
+    // Group short phrases to amortize Whisper's fixed encoder cost.
+    if (this.size >= MAX_SEGMENT_SAMPLES ||
+        (this.size >= MIN_SEGMENT_SAMPLES && this.silence >= RATE * 0.6)) this.flush();
   }
 
   flush() {

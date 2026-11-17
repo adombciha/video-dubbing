@@ -17,6 +17,31 @@ test('silent capture produces no segments and speech buffers stay bounded', () =
   assert.throws(() => segments.push(new Float32Array(1600)));
 });
 
+test('short phrases are combined and manual stop preserves the remaining samples', () => {
+  const audio = [];
+  const expected = [];
+  const segments = new AudioSegments(chunk => audio.push(chunk));
+  for (let phrase = 0; phrase < 3; phrase++) {
+    for (let frame = 0; frame < 12; frame++) {
+      const samples = new Int16Array(1600).fill(frame < 5 ? 1000 + phrase : 0);
+      expected.push(samples);
+      segments.push(samples);
+    }
+    if (phrase === 0) assert.equal(audio.length, 0);
+  }
+  assert.equal(audio.length, 1);
+  assert(audio[0].length >= RATE * 3);
+  for (let frame = 0; frame < 5; frame++) {
+    const samples = new Int16Array(1600).fill(2000);
+    expected.push(samples);
+    segments.push(samples);
+  }
+  segments.flush();
+  assert.equal(audio.length, 2);
+  assert.deepEqual(Buffer.concat(audio.map(chunk => Buffer.from(chunk.buffer))),
+    Buffer.concat(expected.map(chunk => Buffer.from(chunk.buffer))));
+});
+
 test('capture selects audio directly and suppresses local tab playback', () => {
   assert.equal(captureOptions('tab', true).audio.suppressLocalAudioPlayback, true);
   assert.equal(captureOptions('tab', true).video.displaySurface, 'browser');
@@ -109,9 +134,13 @@ test('floating bar still translates and stops every media track', async () => {
   assert.deepEqual(JSON.parse(socket.sent[0]), {source: 'ja', target: 'en'});
   speech(h);
   assert.equal(typeof socket.sent[1], 'object');
-  await socket.onmessage({data: JSON.stringify({type: 'result', text: '<b>Hello</b>', source: 'こんにちは', seconds: 0.2})});
+  await socket.onmessage({data: JSON.stringify({type: 'result', text: '<b>Hello</b>', source: 'こんにちは',
+    seconds: 0.2, asr_seconds: 0.1, translation_seconds: 0.1, audio_seconds: 5})});
   assert.equal(h.nodes.caption.textContent, '<b>Hello</b>');
   assert.equal(h.nodes.original.textContent, 'こんにちは');
+  assert.match(h.nodes.metrics.textContent, /辨識 0.1 秒/);
+  assert.match(h.nodes.metrics.textContent, /翻譯 0.1 秒/);
+  assert.match(h.nodes.metrics.textContent, /25.0×/);
   h.nodes.stop.handlers.click();
   assert.equal(socket.sent.at(-1), 'stop');
   socket.close();
@@ -127,12 +156,28 @@ test('backlog stops capture and finishes all already captured segments', async (
   speech(h, 200);
   assert(h.streams[0].getTracks().every(track => track.stopped));
   for (let i = 0; i < 4; i++) {
-    await socket.onmessage({data: JSON.stringify({type: 'result', text: '字幕', source: 'speech', seconds: 8})});
+    await socket.onmessage({data: JSON.stringify({type: 'result', text: '字幕', source: 'speech', seconds: 8,
+      asr_seconds: 5, translation_seconds: 3, audio_seconds: 5})});
   }
   assert.equal(socket.sent.filter(value => typeof value === 'object').length, 4);
   assert.equal(socket.sent.at(-1), 'stop');
   socket.close();
   assert.match(h.nodes.status.textContent, /處理速度不足/);
+});
+
+test('stop sends a short final phrase without waiting for the minimum chunk length', async () => {
+  const h = harness();
+  const socket = await begin(h);
+  speech(h, 5);
+  h.nodes.stop.handlers.click();
+  const chunks = socket.sent.filter(value => typeof value === 'object');
+  assert.equal(chunks.length, 1);
+  assert.equal(new Int16Array(chunks[0]).length, 8000);
+  await socket.onmessage({data: JSON.stringify({type: 'result', text: '', source: '', seconds: 0.1,
+    asr_seconds: 0.1, translation_seconds: 0, audio_seconds: 0.5})});
+  assert.match(h.nodes.metrics.textContent, /翻譯 0 秒/);
+  assert.equal(socket.sent.at(-1), 'stop');
+  socket.close();
 });
 
 test('stopping during model startup releases capture and permits restarting', async () => {

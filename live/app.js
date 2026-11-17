@@ -134,8 +134,9 @@ async function start() {
           if (data.text) {
             element('caption').textContent = data.text;
             element('original').textContent = data.source;
-            element('metrics').textContent = `本段處理 ${data.seconds} 秒`;
           }
+          const speed = (data.audio_seconds / Math.max(data.seconds, 0.001)).toFixed(1);
+          element('metrics').textContent = `音訊 ${data.audio_seconds} 秒 · 辨識 ${data.asr_seconds} 秒 · 翻譯 ${data.translation_seconds} 秒 · 速度 ${speed}×`;
           busy = false;
           status(stopping ? '已停止收音，完成剩餘片段。' : '正在收音。');
           pump();

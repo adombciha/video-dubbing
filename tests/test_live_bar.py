@@ -1,5 +1,7 @@
+import asyncio
 import json
 import shutil
+import socket
 import subprocess
 import sys
 from itertools import product
@@ -37,6 +39,47 @@ def client(monkeypatch):
 
 def connect(app):
     return app.websocket_connect("/ws/live", headers={"origin": "http://testserver"})
+
+
+def test_uvicorn_accepts_real_websocket_upgrade(client):
+    app, engines = client
+
+    async def check_upgrade():
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.setblocking(False)
+            host, port = listener.getsockname()
+            server = live.uvicorn.Server(live.uvicorn.Config(
+                app.app, loop="asyncio", log_level="warning", timeout_graceful_shutdown=2,
+            ))
+            task = asyncio.create_task(server.serve(sockets=[listener]))
+            writer = None
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5)
+                writer.write((
+                    f"GET /ws/live HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                    f"Origin: http://{host}:{port}\r\n"
+                    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode("ascii"))
+                await writer.drain()
+                response = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+                assert response.startswith(b"HTTP/1.1 101 "), response.decode("ascii", errors="replace")
+                headers = response.decode("ascii").split("\r\n")
+                accept = next(line.split(":", 1)[1].strip() for line in headers
+                              if line.lower().startswith("sec-websocket-accept:"))
+                assert accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+            finally:
+                if writer is not None:
+                    writer.close()
+                    await writer.wait_closed()
+                server.should_exit = True
+                await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(check_upgrade())
+    assert not engines
 
 
 def test_audio_decoding_checks_size_and_keeps_pcm_values():
@@ -144,13 +187,20 @@ def test_inference_failures_report_error_and_cleanup(client, failure, monkeypatc
     engines[0].close.assert_called_once()
 
 
-def test_engine_reuses_medium_gpu_and_keeps_japanese_translation(monkeypatch):
+@pytest.mark.parametrize("actual_context", [None, 0, "32768", 2048, 32768])
+def test_engine_reuses_medium_gpu_and_keeps_japanese_translation(monkeypatch, actual_context):
     model = SimpleNamespace(model=SimpleNamespace(unload_model=Mock()), transcribe=Mock(
         side_effect=lambda *a, **k: (iter([SimpleNamespace(text="こんにちは")]), None)))
     factory = Mock(return_value=model)
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=factory))
     monkeypatch.setitem(sys.modules, "ctranslate2", SimpleNamespace(get_cuda_device_count=lambda: 1))
-    request = Mock(return_value={"message": {"content": json.dumps({"text": "你好"})}})
+    def response(settings, endpoint, payload=None, timeout=180):
+        if endpoint == "/api/ps":
+            return {"models": [{"name": settings.ollama_model, "context_length": actual_context},
+                               {"name": "another-model", "context_length": 65536}]}
+        return {"message": {"content": json.dumps({"text": "你好"})}}
+
+    request = Mock(side_effect=response)
     monkeypatch.setattr(live, "ollama_request", request)
     engine = live.LiveEngine(Settings(whisper_model="medium", asr_device="cuda"), "ja", "zh")
     engine.open()
@@ -159,12 +209,68 @@ def test_engine_reuses_medium_gpu_and_keeps_japanese_translation(monkeypatch):
     payload = request.call_args.args[2]
     assert "繁體中文" in payload["messages"][0]["content"]
     assert payload["keep_alive"] == "3m" and payload["think"] is False
-    assert payload["options"]["num_ctx"] == 2048
+    expected_context = actual_context if type(actual_context) is int and actual_context > 0 else 2048
+    assert payload["options"]["num_ctx"] == expected_context
+    preload = next(call.args[2] for call in request.call_args_list if call.args[1] == "/api/generate")
+    assert preload["options"]["num_ctx"] == expected_context
     assert factory.call_count == 1 and factory.call_args.kwargs["compute_type"] == "int8_float16"
     assert all(call.kwargs["language"] == "ja" for call in model.transcribe.call_args_list)
+    for call in model.transcribe.call_args_list:
+        assert call.kwargs["beam_size"] == call.kwargs["best_of"] == 1
+        assert call.kwargs["temperature"] == 0
+        assert call.kwargs["without_timestamps"] is True
     engine.close()
     model.model.unload_model.assert_called_once()
     assert request.call_args.args[2]["keep_alive"] == 0
+
+
+def test_translation_tracks_context_changes_from_other_clients(monkeypatch):
+    contexts = iter([32768, 4096])
+    def response(settings, endpoint, payload=None, timeout=180):
+        if endpoint == "/api/ps":
+            return {"models": [{"name": settings.ollama_model, "context_length": next(contexts)}]}
+        return {"message": {"content": '{"text":"你好"}'}}
+
+    request = Mock(side_effect=response)
+    monkeypatch.setattr(live, "ollama_request", request)
+    engine = live.LiveEngine(Settings(), "en", "zh")
+    for context in (32768, 4096):
+        assert engine.translate("Hello") == "你好"
+        assert request.call_args.args[2]["options"]["num_ctx"] == context
+
+
+def test_live_timings_include_lazy_asr_iteration_and_translation(monkeypatch):
+    clock = [10.0]
+
+    def transcribe(*args, **kwargs):
+        def segments():
+            clock[0] += 0.75
+            yield SimpleNamespace(text="Hello")
+        return segments(), None
+
+    def translate(text):
+        clock[0] += 0.25
+        return "你好"
+
+    monkeypatch.setattr(live.time, "perf_counter", lambda: clock[0])
+    engine = live.LiveEngine(Settings(), "en", "zh")
+    engine.whisper = SimpleNamespace(transcribe=transcribe)
+    engine.translate = translate
+    result = engine.process(np.ones(live.RATE * 3, dtype=np.float32))
+    assert result["asr_seconds"] == 0.75
+    assert result["translation_seconds"] == 0.25
+    assert result["seconds"] == 1
+    assert result["audio_seconds"] == 3
+
+
+def test_silence_reports_timings_without_requesting_translation(monkeypatch):
+    engine = live.LiveEngine(Settings(), "en", "zh")
+    engine.whisper = SimpleNamespace(transcribe=Mock(return_value=(iter([]), None)))
+    engine.translate = Mock()
+    result = engine.process(np.zeros(live.RATE * 3, dtype=np.float32))
+    assert result["source"] == result["text"] == ""
+    assert result["translation_seconds"] == 0
+    engine.translate.assert_not_called()
 
 
 @pytest.mark.parametrize("target", live.LANGUAGES)
