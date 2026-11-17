@@ -5,7 +5,7 @@ import gradio as gr
 import pytest
 
 import app
-from dubbing import DubbingError, Job, Segment, Settings
+from dubbing import DubbingError, Job, Segment, Settings, SpeechTimingError
 
 
 @pytest.fixture
@@ -65,7 +65,37 @@ def test_render_provides_preview_and_separate_downloads(monkeypatch, demo, tmp_p
     results = (tmp_path / "dubbed.mp4", tmp_path / "translated.srt", tmp_path / "source.srt")
     monkeypatch.setattr(app, "render_job", lambda *a: results)
     output = handler(demo, "render")(job, rows, None)
-    assert output[:4] == (str(results[0]), str(results[0]), str(results[1]), str(results[2]))
+    assert output[:2] == (job, rows)
+    assert output[2:6] == (str(results[0]), str(results[0]), str(results[1]), str(results[2]))
+
+
+def test_render_refreshes_edited_translations_and_explains_shortening(monkeypatch, demo, tmp_path):
+    job = Job(tmp_path, Path("input.mp4"), Path("input.wav"), 4, "zh", "en",
+              [Segment(1, 0, 3, "售價一百元", "The price is 100 dollars.")])
+
+    def render(*args):
+        args[0].segments[0].target = "Price: $100."
+        return (tmp_path / "dubbed.mp4", tmp_path / "translated.srt", tmp_path / "source.srt")
+
+    monkeypatch.setattr(app, "render_job", render)
+    output = handler(demo, "render")(job, app.table_rows(job), None)
+    assert output[1][0][3] == "Price: $100."
+    assert "自動縮短第 1 段" in output[-1]
+
+
+def test_remaining_timing_error_keeps_editor_and_clears_outputs(monkeypatch, demo, tmp_path):
+    job = Job(tmp_path, Path("input.mp4"), Path("input.wav"), 4, "zh", "en",
+              [Segment(1, 0, 3, "原文", "Original translation")])
+
+    def fail(*args):
+        raise SpeechTimingError("已自動縮句並重新配音兩輪，仍需調整")
+
+    monkeypatch.setattr(app, "render_job", fail)
+    rows = app.table_rows(job)
+    output = handler(demo, "render")(job, rows, None)
+    assert output[:2] == (job, rows)
+    assert output[2:6] == (None,) * 4
+    assert "仍需調整" in output[-1]
 
 
 def test_startup_keeps_service_local_and_sharing_disabled(monkeypatch, demo):

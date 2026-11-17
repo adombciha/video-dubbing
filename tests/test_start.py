@@ -8,7 +8,8 @@ import pytest
 
 
 @pytest.mark.parametrize("missing_cuda", [False, True])
-def test_launcher_sets_gpu_models_or_stops_before_startup(tmp_path, monkeypatch, missing_cuda):
+@pytest.mark.parametrize("live", [False, True])
+def test_launcher_sets_gpu_models_or_stops_before_startup(tmp_path, monkeypatch, missing_cuda, live):
     project = tmp_path / "video dubbing"
     python = project / ".venv/bin/python"
     python.parent.mkdir(parents=True)
@@ -30,7 +31,8 @@ def test_launcher_sets_gpu_models_or_stops_before_startup(tmp_path, monkeypatch,
     monkeypatch.setenv("WHISPER_MODEL", "small")
     monkeypatch.setenv("ASR_DEVICE", "cpu")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
-    result = subprocess.run([str(script), "--port", "7861"], cwd=tmp_path,
+    args = [str(script)] + (["--live"] if live else []) + ["--port", "7861"]
+    result = subprocess.run(args, cwd=tmp_path,
                             capture_output=True, text=True, check=False, timeout=10)
     if missing_cuda:
         assert result.returncode == 1
@@ -40,7 +42,8 @@ def test_launcher_sets_gpu_models_or_stops_before_startup(tmp_path, monkeypatch,
         assert result.returncode == 0, result.stderr
         actual = json.loads(result.stdout)
         assert actual["cwd"] == str(project)
-        assert actual["args"] == [str(project / "app.py"), "--host", "0.0.0.0", "--port", "7861"]
+        assert actual["args"] == [str(project / ("live_bar.py" if live else "app.py")), "--host",
+                                  "127.0.0.1" if live else "0.0.0.0", "--port", "7861"]
         assert actual["env"]["OLLAMA_MODEL"] == "gemma4:e2b"
         assert actual["env"]["WHISPER_MODEL"] == "medium"
         assert actual["env"]["ASR_DEVICE"] == "cuda"

@@ -15,4 +15,9 @@ if ! cuda_libs=$("$python" -c 'import nvidia.cublas, nvidia.cudnn; print(nvidia.
 fi
 export LD_LIBRARY_PATH="$cuda_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+if [[ "${1:-}" == "--live" ]]; then
+    shift
+    exec "$python" "$PWD/live_bar.py" --host 127.0.0.1 "$@"
+fi
+
 exec "$python" "$PWD/app.py" --host 0.0.0.0 "$@"

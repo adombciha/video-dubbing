@@ -12,6 +12,7 @@ from dubbing import (
     DIRECTIONS,
     DubbingError,
     Settings,
+    SpeechTimingError,
     apply_edits,
     check_environment,
     prepare_video,
@@ -71,8 +72,15 @@ def build_app(settings=None):
             raise gr.Error("請先上傳影片並完成辨識。")
         try:
             apply_edits(job, rows)
+            before = {segment.id: segment.target for segment in job.segments}
             video, translated, source = render_job(job, reference, settings, progress)
-            return str(video), str(video), str(translated), str(source), "配音完成。可播放預覽，或下載影片與字幕。"
+            changed = [str(segment.id) for segment in job.segments if segment.target != before[segment.id]]
+            status = "配音完成。可播放預覽，或下載影片與字幕。"
+            if changed:
+                status += f" 自動縮短第 {', '.join(changed)} 段；請校對更新後的配音譯文。原譯文已備份。"
+            return job, table_rows(job), str(video), str(video), str(translated), str(source), status
+        except SpeechTimingError as exc:
+            return job, table_rows(job), None, None, None, None, str(exc)
         except DubbingError as exc:
             raise gr.Error(str(exc)) from exc
 
@@ -90,7 +98,7 @@ def build_app(settings=None):
             with gr.Column():
                 direction = gr.Radio(list(DIRECTIONS), value="中文 → 英文", label="翻譯方向")
                 prepare_button = gr.Button("辨識與翻譯", variant="primary")
-        status = gr.Textbox(label="處理狀態", value="請先選擇影片。", interactive=False)
+        status = gr.Textbox(label="處理狀態", value="請先選擇影片。", interactive=False, lines=3)
         gr.Markdown("### 2. 校對逐句文字\n只修改「原文」與「配音譯文」，保留段落編號與順序。修改原文後，可重新翻譯。")
         rows = gr.Dataframe(
             headers=["編號", "原始時間", "原文", "配音譯文"], datatype=["str"] * 4,
@@ -100,7 +108,7 @@ def build_app(settings=None):
         translate_button = gr.Button("依修正原文重新翻譯")
         gr.Markdown("### 3. 產生配音\n預設使用影片中的聲音作參考。也可提供你自己的 3–15 秒乾淨人聲，較長檔案只取前 15 秒。")
         reference = gr.File(label="參考聲音（選填）", file_types=["audio"], type="filepath")
-        gr.Markdown("配音會替換整條原音軌，背景音樂及操作聲也會移除。超時的段落會提示縮短譯文。")
+        gr.Markdown("配音會替換整條原音軌，背景音樂及操作聲也會移除。超時段落會自動縮句並重配，最多兩輪；完成後請校對更新的譯文。")
         render_button = gr.Button("產生配音影片", variant="primary")
         preview = gr.Video(label="配音預覽", interactive=False)
         with gr.Row():
@@ -119,7 +127,7 @@ def build_app(settings=None):
         )
         render_button.click(
             render, inputs=[job, rows, reference],
-            outputs=[preview, download_video, download_translation, download_source, status],
+            outputs=[job, rows, preview, download_video, download_translation, download_source, status],
             concurrency_id="models", concurrency_limit=1, api_name=False,
         )
         # Invalidate stale work before allowing a different input to be processed.

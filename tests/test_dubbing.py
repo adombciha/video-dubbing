@@ -43,6 +43,25 @@ def translation_response(rows):
     return {"message": {"content": json.dumps({"segments": rows})}}
 
 
+@pytest.fixture
+def fake_cosyvoice_session(monkeypatch):
+    class Session:
+        def __init__(self, settings, folder):
+            self.settings = settings
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def synthesize(self, request):
+            d.run_command([self.settings.cosyvoice_python, str(d.ROOT / "cosyvoice_worker.py"), str(request),
+                           "--root", str(self.settings.cosyvoice_root), "--model", str(self.settings.cosyvoice_model)])
+
+    monkeypatch.setattr(d, "CosyVoiceSession", Session)
+
+
 def test_translations_preserve_ids_and_release_ollama(monkeypatch, job):
     request = Mock(return_value=translation_response([{"id": 1, "text": " Price: $100. "}, {"id": 2, "text": "Press Start."}]))
     monkeypatch.setattr(d, "ollama_request", request)
@@ -140,6 +159,25 @@ def test_translation_batches_keep_global_ids(monkeypatch):
     d.translate_segments(segments, "en", d.Settings())
     assert calls == [list(range(1, 13)), [13, 14]]
     assert segments[-1].target == "translated 14"
+
+
+@pytest.mark.parametrize("language", ["en", "zh"])
+def test_shortening_uses_measured_duration_and_preserves_source_context(monkeypatch, job, language):
+    segment = job.segments[0]
+    request = Mock(return_value=translation_response([{"id": 1, "text": "100"}]))
+    monkeypatch.setattr(d, "ollama_request", request)
+    previous = segment.target
+    d.translate_segments([segment], language, d.Settings(), timing={
+        1: {"seconds": 1, "previous_text": previous, "previous_seconds": 3},
+    })
+    payload = request.call_args.args[2]
+    row = json.loads(payload["messages"][1]["content"])[0]
+    assert row["text"] == segment.source
+    assert row["previous_text"] == previous
+    assert row["seconds"] == 1 and row["previous_seconds"] == 3
+    assert row["max_words" if language == "en" else "max_characters"] >= 1
+    assert "essential facts" in payload["messages"][0]["content"]
+    assert "actual speech" in payload["messages"][0]["content"]
 
 
 @pytest.mark.parametrize("segments", [[], [d.Segment(1, 1, 0, "wrong")], [d.Segment(1, 0, float("nan"), "wrong")],
@@ -281,7 +319,7 @@ def test_prepare_stages_original_and_saves_both_languages(monkeypatch, tmp_path)
     assert json.loads((job.folder / "job.json").read_text())["segments"][0]["target"] == "Hello"
 
 
-def test_render_outputs_and_keeps_original_untouched(monkeypatch, job, tmp_path):
+def test_render_outputs_and_keeps_original_untouched(monkeypatch, job, tmp_path, fake_cosyvoice_session):
     model = tmp_path / "model"
     model.mkdir()
     (model / "cosyvoice3.yaml").touch()
@@ -311,8 +349,95 @@ def test_render_outputs_and_keeps_original_untouched(monkeypatch, job, tmp_path)
     assert mux[mux.index("-movflags") + 1] == "+faststart"
 
 
+@pytest.mark.parametrize("durations", [[3, 1], [3, 3, 1], [3, 3, 3], [2.15, 1]])
+def test_render_shortens_only_overflow_and_limits_retries(monkeypatch, job, tmp_path, durations, fake_cosyvoice_session):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "cosyvoice3.yaml").touch()
+    settings = replace(d.Settings(), cosyvoice_model=model)
+    job.save()
+    before = copy.deepcopy(job.segments)
+    saved = (job.folder / "job.json").read_bytes()
+    requests = []
+
+    def run(command, **kwargs):
+        if command[1] == str(d.ROOT / "cosyvoice_worker.py"):
+            path = Path(command[2])
+            request = json.loads(path.read_text())
+            requests.append(request)
+            for segment in request["segments"]:
+                seconds = durations[len(requests) - 1] if segment["id"] == 1 else 0.6
+                make_wav(path.parent / f"speech-{segment['id']}.wav", seconds)
+        elif command[-1].endswith(".wav"):
+            make_wav(Path(command[-1]), 3)
+        else:
+            Path(command[-1]).write_bytes(b"rendered")
+
+    translate = Mock(return_value=translation_response([{"id": 1, "text": "Price: $100."}]))
+    monkeypatch.setattr(d, "run_command", run)
+    monkeypatch.setattr(d, "ollama_request", translate)
+    if durations[-1] == 3:
+        with pytest.raises(d.SpeechTimingError, match="兩輪"):
+            d.render_job(job, None, settings)
+        assert job.segments == before
+        assert (job.folder / "job.json").read_bytes() == saved
+        assert not list(job.folder.glob("render-*/dubbed.mp4"))
+    else:
+        output, subtitles, _ = d.render_job(job, None, settings)
+        assert output.is_file()
+        assert job.segments[0].target == "Price: $100."
+        assert job.segments[1] == before[1]
+        assert "Price: $100." in subtitles.read_text()
+        assert json.loads((job.folder / "job.json").read_text())["segments"][0]["target"] == "Price: $100."
+    assert len(requests) == len(durations)
+    assert [segment["id"] for segment in requests[0]["segments"]] == [1, 2]
+    assert all([segment["id"] for segment in request["segments"]] == [1] for request in requests[1:])
+    assert translate.call_count == len(durations) - 1
+    folder = next(job.folder.glob("render-*"))
+    backup = json.loads((folder / "original-segments.json").read_text())
+    assert [segment["target"] for segment in backup] == [segment.target for segment in before]
+    assert d.wav_info(folder / "speech-1.wav") == round(durations[0] * d.SAMPLE_RATE)
+
+
+@pytest.mark.parametrize("failure", ["translation", "speech", "mux"])
+def test_failed_automatic_fitting_never_changes_user_translations(monkeypatch, job, tmp_path, failure, fake_cosyvoice_session):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "cosyvoice3.yaml").touch()
+    settings = replace(d.Settings(), cosyvoice_model=model)
+    job.save()
+    before = copy.deepcopy(job.segments)
+    saved = (job.folder / "job.json").read_bytes()
+    calls = []
+
+    def run(command, **kwargs):
+        if command[1] == str(d.ROOT / "cosyvoice_worker.py"):
+            path = Path(command[2])
+            request = json.loads(path.read_text())
+            calls.append(request)
+            if len(calls) == 2 and failure == "speech":
+                raise d.DubbingError("speech failed")
+            for segment in request["segments"]:
+                make_wav(path.parent / f"speech-{segment['id']}.wav",
+                         3 if segment["id"] == 1 and len(calls) == 1 else 0.6)
+        elif command[-1].endswith(".wav"):
+            make_wav(Path(command[-1]), 3)
+        else:
+            raise d.DubbingError("mux failed")
+
+    response = [] if failure == "translation" else [{"id": 1, "text": "Price: $100."}]
+    monkeypatch.setattr(d, "run_command", run)
+    monkeypatch.setattr(d, "ollama_request", Mock(return_value=translation_response(response)))
+    with pytest.raises(d.DubbingError):
+        d.render_job(job, None, settings)
+    assert job.segments == before
+    assert (job.folder / "job.json").read_bytes() == saved
+    assert job.video.read_bytes() == b"original video"
+
+
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg and ffprobe required")
-def test_real_ffmpeg_timing_and_browser_compatible_mux(tmp_path, monkeypatch):
+@pytest.mark.parametrize("needs_shortening", [False, True])
+def test_real_ffmpeg_timing_and_browser_compatible_mux(tmp_path, monkeypatch, needs_shortening, fake_cosyvoice_session):
     settings = d.Settings()
     video = tmp_path / "original.mp4"
     d.run_command([settings.ffmpeg, "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=160x120:d=4",
@@ -328,16 +453,21 @@ def test_real_ffmpeg_timing_and_browser_compatible_mux(tmp_path, monkeypatch):
     reference = make_wav(tmp_path / "reference.wav", 3)
     real_run = d.run_command
     original_bytes = video.read_bytes()
+    speech_requests = []
 
     def synthesize_only(command, **kwargs):
         if len(command) > 1 and command[1] == str(d.ROOT / "cosyvoice_worker.py"):
             request_path = Path(command[2])
-            make_wav(request_path.parent / "speech-1.wav", 2.1)
-            make_wav(request_path.parent / "speech-2.wav", 1)
+            segments = json.loads(request_path.read_text())["segments"]
+            speech_requests.append([segment["id"] for segment in segments])
+            for segment in segments:
+                seconds = (3 if needs_shortening and len(speech_requests) == 1 else 2.1) if segment["id"] == 1 else 1
+                make_wav(request_path.parent / f"speech-{segment['id']}.wav", seconds)
             return ""
         return real_run(command, **kwargs)
 
     monkeypatch.setattr(d, "run_command", synthesize_only)
+    monkeypatch.setattr(d, "ollama_request", Mock(return_value=translation_response([{"id": 1, "text": "Short first"}])))
     output, translation, source = d.render_job(job, str(reference), settings)
     assert abs(d.probe_video(output, settings) - duration) < 0.1
     with wave.open(str(output.parent / "dubbed.wav"), "rb") as result:
@@ -348,6 +478,11 @@ def test_real_ffmpeg_timing_and_browser_compatible_mux(tmp_path, monkeypatch):
     assert streams["audio"]["codec_name"] == "aac"
     assert translation.is_file() and source.is_file()
     assert video.read_bytes() == original_bytes
+    assert speech_requests == ([[1, 2], [1]] if needs_shortening else [[1, 2]])
+    if needs_shortening:
+        assert "Short first" in translation.read_text()
+        assert "第一句" in source.read_text()
+        assert d.wav_info(output.parent / "speech-1.wav") == 3 * d.SAMPLE_RATE
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg and ffprobe required")
