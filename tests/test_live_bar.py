@@ -4,10 +4,12 @@ import shutil
 import socket
 import subprocess
 import sys
+from copy import deepcopy
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.error import HTTPError
 
 import numpy as np
 import pytest
@@ -143,6 +145,28 @@ def test_only_one_capture_can_use_models_and_disconnect_releases_it(client):
     assert all(engine.close.call_count == 1 for engine in engines)
 
 
+def test_client_disconnect_during_close_does_not_escape_asgi(client):
+    app, engines = client
+    messages = iter([
+        {"type": "websocket.connect"},
+        {"type": "websocket.receive", "text": '{"source":"en","target":"zh"}'},
+        {"type": "websocket.disconnect", "code": 1001},
+    ])
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        if message["type"] == "websocket.close":
+            raise OSError("Client connection already closed")
+
+    asyncio.run(app.app({
+        "type": "websocket", "scheme": "ws", "path": "/ws/live", "query_string": b"",
+        "headers": [(b"host", b"testserver"), (b"origin", b"http://testserver")],
+    }, receive, send))
+    engines[0].close.assert_called_once()
+
+
 def test_origin_and_optional_login_protect_audio_endpoints(client, monkeypatch):
     app, engines = client
     with pytest.raises(WebSocketDisconnect), app.websocket_connect("/ws/live", headers={"origin": "https://unrelated.test"}):
@@ -271,6 +295,57 @@ def test_silence_reports_timings_without_requesting_translation(monkeypatch):
     assert result["source"] == result["text"] == ""
     assert result["translation_seconds"] == 0
     engine.translate.assert_not_called()
+
+
+@pytest.mark.parametrize("retry_fails", [False, True])
+def test_repeat_abort_retries_once_and_does_not_lose_the_next_segment(monkeypatch, retry_fails):
+    inputs = iter(["Hello", "Goodbye"])
+    requests = []
+
+    def response(settings, endpoint, payload=None, timeout=180):
+        if endpoint == "/api/ps":
+            return {"models": []}
+        requests.append((deepcopy(payload), timeout))
+        if len(requests) == 1 or (len(requests) == 2 and retry_fails):
+            raise DubbingError("prediction aborted, token repeat limit reached") from HTTPError(
+                settings.ollama_url, 500, "Internal Server Error", {}, None,
+            )
+        content = "你好" if len(requests) == 2 else '{"text":"再見"}'
+        return {"message": {"content": content}, "done_reason": "stop"}
+
+    monkeypatch.setattr(live, "ollama_request", response)
+    engine = live.LiveEngine(Settings(), "en", "zh")
+    engine.whisper = SimpleNamespace(transcribe=lambda *args, **kwargs: (
+        [SimpleNamespace(text=next(inputs))], None,
+    ))
+    audio = np.ones(live.RATE, dtype=np.float32)
+    result = engine.process(audio)
+    assert result["source"] == "Hello"
+    assert result["translation_failed"] is retry_fails
+    assert result["text"] == ("" if retry_fails else "你好")
+    assert engine.process(audio)["text"] == "再見"
+    first, retry, next_segment = requests
+    assert "format" in first[0] and "format" in next_segment[0]
+    assert "format" not in retry[0]
+    assert retry[0]["options"]["temperature"] > first[0]["options"]["temperature"]
+    assert retry[0]["messages"][1] == first[0]["messages"][1]
+    assert retry[1] < first[1]
+
+
+def test_unrelated_500_reports_the_original_failure(monkeypatch):
+    error = HTTPError("http://localhost:11434/api/chat", 500, "Internal Server Error", {}, None)
+
+    def response(settings, endpoint, payload=None, timeout=180):
+        if endpoint == "/api/ps":
+            return {"models": []}
+        raise DubbingError("model runner stopped") from error
+
+    request = Mock(side_effect=response)
+    monkeypatch.setattr(live, "ollama_request", request)
+    engine = live.LiveEngine(Settings(), "en", "zh")
+    with pytest.raises(DubbingError, match="model runner stopped"):
+        engine.translate("Hello")
+    assert [call.args[1] for call in request.call_args_list] == ["/api/ps", "/api/chat"]
 
 
 @pytest.mark.parametrize("target", live.LANGUAGES)

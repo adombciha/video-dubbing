@@ -50,7 +50,7 @@ test('capture selects audio directly and suppresses local tab playback', () => {
   assert.equal(captureOptions('system', true).audio.suppressLocalAudioPlayback, false);
 });
 
-function harness() {
+function harness({rejectPiP = false, rejectShare = false} = {}) {
   const ids = ['home', 'bar', 'audio-source', 'source', 'target', 'mute', 'start', 'stop', 'float', 'caption', 'original', 'metrics', 'status'];
   const nodes = Object.fromEntries(ids.map(id => [id, {
     id, dataset: {}, handlers: {}, value: '', textContent: '', disabled: false,
@@ -63,12 +63,20 @@ function harness() {
   let floating = false;
   nodes.home.append = () => { floating = false; };
   const document = {
+    documentElement: {lang: 'zh-Hant'},
     querySelectorAll: () => Object.values(nodes),
     getElementById: id => floating && id !== 'home' ? null : nodes[id],
   };
+  const steps = [];
+  let requestedSize;
   const popup = {
-    document: {createElement: () => ({}), head: {append() {}}, body: {append() { floating = true; }}},
+    document: {createElement: () => ({}), documentElement: {}, head: {append() {}},
+      body: {classList: {add() {}}, append() { floating = true; }}},
     handlers: {}, addEventListener(name, callback) { this.handlers[name] = callback; },
+    close() {
+      window.documentPictureInPicture.window = null;
+      this.handlers.pagehide?.();
+    },
   };
   const sockets = [], streams = [], contexts = [], processors = [];
   class Socket {
@@ -94,11 +102,19 @@ function harness() {
     disconnect() {}
   }
   const window = {isSecureContext: true, addEventListener() {}, documentPictureInPicture: {
-    async requestWindow() { this.window = popup; return popup; },
+    async requestWindow(options) {
+      steps.push('pip');
+      requestedSize = options;
+      if (rejectPiP) throw new Error('Activation unavailable');
+      this.window = popup;
+      return popup;
+    },
   }};
   const context = vm.createContext({
     document, window, location: {protocol: 'http:', host: '127.0.0.1:7860', href: 'http://127.0.0.1:7860/'},
     navigator: {mediaDevices: {async getDisplayMedia() {
+      steps.push('share');
+      if (rejectShare) throw new Error('Share cancelled');
       const tracks = [0, 1].map(() => ({stopped: false, stop() { this.stopped = true; }, addEventListener() {}}));
       const stream = {getTracks: () => tracks, getAudioTracks: () => [tracks[0]]};
       streams.push(stream);
@@ -108,7 +124,8 @@ function harness() {
   });
   const code = readFileSync(new URL('../live/app.js', import.meta.url), 'utf8').replace(/^import[^\n]*\n/, '');
   vm.runInContext(code, context);
-  return {nodes, popup, sockets, streams, contexts, processors};
+  return {nodes, popup, sockets, streams, contexts, processors, steps,
+    get floating() { return floating; }, get requestedSize() { return requestedSize; }};
 }
 
 async function begin(h) {
@@ -125,12 +142,15 @@ function speech(h, count = 50) {
   }
 }
 
-test('floating bar still translates and stops every media track', async () => {
+test('sharing opens a compact floating bar and stop returns it to the main page', async () => {
   const h = harness();
-  await h.nodes.float.handlers.click();
   h.nodes.source.value = 'ja';
   h.nodes.target.value = 'en';
   const socket = await begin(h);
+  assert.deepEqual(h.steps, ['share', 'pip']);
+  assert.equal(h.floating, true);
+  assert.equal(h.requestedSize.width, 1200);
+  assert.equal(h.requestedSize.height, 132);
   assert.deepEqual(JSON.parse(socket.sent[0]), {source: 'ja', target: 'en'});
   speech(h);
   assert.equal(typeof socket.sent[1], 'object');
@@ -147,7 +167,34 @@ test('floating bar still translates and stops every media track', async () => {
   assert(h.streams[0].getTracks().every(track => track.stopped));
   assert(h.contexts[0].closed);
   assert.equal(h.nodes.start.disabled, false);
-  h.popup.handlers.pagehide();
+  assert.equal(h.floating, false);
+});
+
+test('cancelled sharing opens no window and denied PiP still allows translation', async () => {
+  const cancelled = harness({rejectShare: true});
+  await cancelled.nodes.start.handlers.click();
+  assert.deepEqual(cancelled.steps, ['share']);
+  assert.equal(cancelled.sockets.length, 0);
+  assert.equal(cancelled.nodes.start.disabled, false);
+  const page = harness({rejectPiP: true});
+  await begin(page);
+  assert.equal(page.floating, false);
+  assert.match(page.nodes.status.textContent, /正在收音/);
+  assert.equal(page.nodes.float.disabled, false);
+});
+
+test('failed translation shows the source and the next segment still translates', async () => {
+  const h = harness();
+  const socket = await begin(h);
+  speech(h, 100);
+  const result = {type: 'result', seconds: 0.2, asr_seconds: 0.1, translation_seconds: 0.1, audio_seconds: 5};
+  await socket.onmessage({data: JSON.stringify({...result, text: '', source: 'Hello', translation_failed: true})});
+  assert.match(h.nodes.caption.textContent, /翻譯失敗.*Hello/);
+  assert.equal(h.nodes.caption.lang, 'en');
+  assert.equal(socket.sent.filter(value => typeof value === 'object').length, 2);
+  await socket.onmessage({data: JSON.stringify({...result, text: '再見', source: 'Goodbye'})});
+  assert.equal(h.nodes.caption.textContent, '再見');
+  assert.equal(h.nodes.caption.lang, 'zh-Hant');
 });
 
 test('backlog stops capture and finishes all already captured segments', async () => {

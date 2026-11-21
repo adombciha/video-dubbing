@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -49,3 +50,29 @@ def test_launcher_sets_gpu_models_or_stops_before_startup(tmp_path, monkeypatch,
         assert actual["env"]["ASR_DEVICE"] == "cuda"
         assert actual["env"]["COSYVOICE_PYTHON"] == str(project / ".venv-cosyvoice/bin/python")
         assert actual["env"]["LD_LIBRARY_PATH"] == "/cuda/cublas/lib:/cuda/cudnn/lib:/existing/lib"
+
+
+@pytest.mark.parametrize(("mode", "override", "expected"), [
+    ("nat", None, "http://172.28.32.1:11434"),
+    ("mirrored", None, "http://127.0.0.1:11434"),
+    ("nat", "http://my-ollama:11434", "http://my-ollama:11434"),
+    ("unknown", None, ""),
+])
+def test_launcher_discovers_windows_ollama_unless_explicit(tmp_path, monkeypatch, mode, override, expected):
+    script = tmp_path / "start.sh"
+    shutil.copy(Path(__file__).resolve().parents[1] / "start.sh", script)
+    python = tmp_path / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text('#!/bin/bash\nif [[ "$1" == "-c" ]]; then echo /cuda; else echo "${OLLAMA_URL:-}"; fi\n')
+    wslinfo = tmp_path / "wslinfo"
+    wslinfo.write_text(f"#!/bin/bash\necho {mode}\n")
+    ip = tmp_path / "ip"
+    ip.write_text("#!/bin/bash\necho 'default via 172.28.32.1 dev eth0'\n")
+    for command in (python, wslinfo, ip):
+        command.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.delenv("OLLAMA_URL", raising=False)
+    if override:
+        monkeypatch.setenv("OLLAMA_URL", override)
+    result = subprocess.run([str(script), "--live"], capture_output=True, text=True, check=True, timeout=10)
+    assert result.stdout.strip() == expected

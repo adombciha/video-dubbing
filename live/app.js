@@ -16,6 +16,10 @@ function setActive(value) {
   element('start').disabled = value;
   element('stop').disabled = !value || stopping;
   controls.forEach(control => { control.disabled = value; });
+  if (!value) {
+    element('float').disabled = true;
+    window.documentPictureInPicture?.window?.close();
+  }
 }
 
 function stopMedia() {
@@ -90,7 +94,28 @@ async function beginCapture() {
   input.connect(processor);
   processor.connect(context.destination);
   accepting = true;
+  element('float').disabled = false;
   status('正在收音，可以播放來源內容。');
+}
+
+async function openFloatingBar() {
+  const pip = window.documentPictureInPicture;
+  if (!pip) throw new Error('此瀏覽器不支援置頂視窗，可以繼續使用目前字幕列。');
+  if (pip.window) return;
+  const floating = await pip.requestWindow({width: 1200, height: 132, preferInitialWindowPlacement: true});
+  if (!active || stopping) { floating.close(); return; }
+  const style = floating.document.createElement('link');
+  style.rel = 'stylesheet';
+  style.href = new URL('/static/style.css', location.href).href;
+  floating.document.head.append(style);
+  floating.document.documentElement.lang = document.documentElement.lang;
+  floating.document.title = '即時翻譯字幕';
+  floating.document.body.classList.add('floating');
+  floating.document.body.append(element('bar'));
+  floating.addEventListener('pagehide', () => {
+    element('home').append(element('bar'));
+    stop();
+  }, {once: true});
 }
 
 async function start() {
@@ -103,13 +128,21 @@ async function start() {
     busy = stopping = overload = false;
     segmenter = null;
     setActive(true);
-    element('caption').lang = element('target').value === 'zh' ? 'zh-Hant' : element('target').value;
+    const targetLanguage = element('target').value === 'zh' ? 'zh-Hant' : element('target').value;
+    element('caption').lang = targetLanguage;
     element('original').lang = element('source').value;
     status('請選擇來源，並勾選「分享音訊」。');
     stream = await navigator.mediaDevices.getDisplayMedia(captureOptions(element('audio-source').value, element('mute').checked));
+    if (!stopping) {
+      if (!stream.getAudioTracks().length) throw new Error('沒有取得音訊，請重新選擇並勾選「分享音訊」。');
+      stream.getTracks().forEach(track => track.addEventListener('ended', stop, {once: true}));
+      if (window.documentPictureInPicture) {
+        // Chrome grants activation when the user confirms the share picker.
+        try { await openFloatingBar(); }
+        catch { /* The manual PiP button remains available after startup. */ }
+      }
+    }
     if (stopping) { stopMedia(); stopping = false; setActive(false); status('已停止，音訊來源已釋放。'); return; }
-    if (!stream.getAudioTracks().length) throw new Error('沒有取得音訊，請重新選擇並勾選「分享音訊」。');
-    stream.getTracks().forEach(track => track.addEventListener('ended', stop, {once: true}));
     context = new AudioContext({sampleRate: RATE});
     const currentContext = context;
     await currentContext.resume();
@@ -131,9 +164,12 @@ async function start() {
         if (data.type === 'ready') await beginCapture();
         if (data.type === 'error') throw new Error(data.message);
         if (data.type === 'result') {
-          if (data.text) {
-            element('caption').textContent = data.text;
+          if (data.text || data.translation_failed) {
+            const caption = element('caption');
+            caption.lang = data.translation_failed ? element('original').lang : targetLanguage;
+            caption.textContent = data.translation_failed ? `〔翻譯失敗，顯示原文〕${data.source}` : data.text;
             element('original').textContent = data.source;
+            caption.scrollTop = 0;
           }
           const speed = (data.audio_seconds / Math.max(data.seconds, 0.001)).toFixed(1);
           element('metrics').textContent = `音訊 ${data.audio_seconds} 秒 · 辨識 ${data.asr_seconds} 秒 · 翻譯 ${data.translation_seconds} 秒 · 速度 ${speed}×`;
@@ -165,20 +201,7 @@ async function start() {
 element('start').addEventListener('click', start);
 element('stop').addEventListener('click', stop);
 element('float').addEventListener('click', async () => {
-  try {
-    if (!window.documentPictureInPicture) throw new Error('此瀏覽器不支援置頂視窗，可以繼續使用目前字幕列。');
-    if (window.documentPictureInPicture.window) return;
-    const floating = await window.documentPictureInPicture.requestWindow({width: 1080, height: 260});
-    const style = floating.document.createElement('link');
-    style.rel = 'stylesheet';
-    style.href = new URL('/static/style.css', location.href).href;
-    floating.document.head.append(style);
-    floating.document.title = '即時翻譯字幕';
-    floating.document.body.append(element('bar'));
-    floating.addEventListener('pagehide', () => {
-      element('home').append(element('bar'));
-      stop();
-    }, {once: true});
-  } catch (error) { status(error.message, true); }
+  try { await openFloatingBar(); }
+  catch (error) { status(error.message, true); }
 });
 window.addEventListener('beforeunload', () => { stopMedia(); socket?.close(); });

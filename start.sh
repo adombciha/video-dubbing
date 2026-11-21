@@ -9,6 +9,19 @@ export WHISPER_MODEL="medium"
 export ASR_DEVICE="cuda"
 export COSYVOICE_PYTHON="$PWD/.venv-cosyvoice/bin/python"
 
+if [[ -z "${OLLAMA_URL:-}" ]] && command -v wslinfo >/dev/null; then
+    case "$(wslinfo --networking-mode 2>/dev/null || true)" in
+        nat)
+            if ollama_host=$(ip -4 route show default | awk '$1 == "default" && $2 == "via" {print $3; exit}') && [[ -n "$ollama_host" ]]; then
+                export OLLAMA_URL="http://${ollama_host}:11434"
+            fi
+            ;;
+        mirrored)
+            export OLLAMA_URL="http://127.0.0.1:11434"
+            ;;
+    esac
+fi
+
 if ! cuda_libs=$("$python" -c 'import nvidia.cublas, nvidia.cudnn; print(nvidia.cublas.__path__[0]+"/lib:"+nvidia.cudnn.__path__[0]+"/lib")'); then
     printf '%s\n' '無法載入 GPU 依賴；請依 README 安裝主環境的 cuBLAS 與 cuDNN 9。' >&2
     exit 1
